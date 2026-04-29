@@ -4,7 +4,12 @@ export interface AppConfig {
   heliusApiKeys: string[];
   rateLimitPerKey: number;
   outputFile: string;
-  pumpProgramIds: string[];
+  eventsCheckpointFile: string;
+  writeIntervalSec: number;
+  txChunkSize: number;
+  pumpFunProgramIds: string[];
+  pumpFunEventAuthority: string;
+  pumpFunFeeRecipient: string;
   minSolChange: number;
   minTokenChange: number;
 }
@@ -97,6 +102,7 @@ export interface SellRecordOut {
   multiplier: number;
   pct: number;
   delaySec: number;
+  time: string;
 }
 
 export interface TradeRecord {
@@ -104,6 +110,7 @@ export interface TradeRecord {
   buy: {
     sol: number;
     tx: string;
+    time: string;
   };
   sells: SellRecordOut[];
   exit: {
@@ -124,7 +131,10 @@ export interface RunSummary {
   targetWallet: string;
   hoursBack: number;
   signaturesFetched: number;
-  transactionsParsed: number;
+  transactionsFetched: number;
+  pumpTradeTxKept: number;
+  ignoredNonTradeTx: number;
+  ignoredTransferOrNonPumpTx: number;
   buyEvents: number;
   sellEvents: number;
   tradeRecords: number;

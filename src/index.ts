@@ -5,17 +5,32 @@ import { KeyPool } from "./rateLimiter.js";
 import { HeliusClient } from "./heliusClient.js";
 import { fetchSignatures } from "./fetchSignatures.js";
 import { fetchTransactions } from "./fetchTransactions.js";
-import { parseTradeEventsFromTx } from "./parseTradeEvents.js";
+import { extractAccountKeys, isPumpFunTradeTx } from "./pumpFunFilter.js";
+import { parsePumpFunTrade } from "./parsePumpFunTrade.js";
 import { groupTrades } from "./groupTrades.js";
 import { buildTradeRecords } from "./formatOutput.js";
 import { PhaseBar } from "./progress.js";
-import type { ParsedTradeEvent, RunSummary, TradeRecord } from "./types.js";
+import {
+  appendCheckpoint,
+  loadCheckpoint,
+  type CheckpointEntry,
+} from "./checkpoint.js";
+import type {
+  FullTransaction,
+  ParsedTradeEvent,
+  RunSummary,
+  TradeRecord,
+} from "./types.js";
 
 async function main(): Promise<void> {
+  // ---- Phase 1: config ----------------------------------------------------
   console.log("[1/6] Loading config...");
   const cfg = loadConfig();
   console.log(
     `       wallet=${cfg.targetWallet}  hours=${cfg.hoursBack}  keys=${cfg.heliusApiKeys.length}  rate=${cfg.rateLimitPerKey}/key`,
+  );
+  console.log(
+    `       checkpoint=${cfg.eventsCheckpointFile}  flushEvery=${cfg.writeIntervalSec}s  chunk=${cfg.txChunkSize}`,
   );
 
   const pool = new KeyPool(cfg.heliusApiKeys, cfg.rateLimitPerKey);
@@ -40,121 +55,181 @@ async function main(): Promise<void> {
   console.log(`       collected ${signatures.length} signatures (last in-flight count ${lastSigCount})`);
 
   if (signatures.length === 0) {
-    const summary: RunSummary = {
+    await writeOutputAtomic(cfg.outputFile, []);
+    printSummary({
       targetWallet: cfg.targetWallet,
       hoursBack: cfg.hoursBack,
       signaturesFetched: 0,
-      transactionsParsed: 0,
+      transactionsFetched: 0,
+      pumpTradeTxKept: 0,
+      ignoredNonTradeTx: 0,
+      ignoredTransferOrNonPumpTx: 0,
       buyEvents: 0,
       sellEvents: 0,
       tradeRecords: 0,
       fullyExited: 0,
       unfinished: 0,
       outputFile: cfg.outputFile,
-    };
-    await writeOutput(cfg.outputFile, []);
-    printSummary(summary);
+    });
     console.log("No trading activity found in the requested window.");
     return;
   }
 
-  // ---- Phase 3: transactions ---------------------------------------------
-  console.log("[3/6] Fetching transactions...");
-  const txBar = new PhaseBar({
-    label: "Fetching tx",
-    total: signatures.length,
-    showKey: true,
-    showRetries: true,
-  });
-
-  // Tune concurrency: total budget roughly equals (keys * rate-per-key), but
-  // cap a bit lower to leave headroom for retries and bursts.
-  const concurrency = Math.max(1, Math.floor(cfg.heliusApiKeys.length * cfg.rateLimitPerKey * 0.9));
-
-  const fetched = await fetchTransactions(client, {
-    signatures,
-    concurrency,
-    onTick: (done, total, retries, lastKeyIndex) => {
-      txBar.update(done, {
-        keyIndex: lastKeyIndex + 1,
-        keyTotal: cfg.heliusApiKeys.length,
-        retries,
-        label: "Fetching tx",
-      });
-    },
-  });
-  txBar.stop();
-  const txOk = fetched.filter((f) => f.tx !== null).length;
-  const txErr = fetched.length - txOk;
-  console.log(`       fetched ${txOk} transactions, ${txErr} errors, retries=${client.stats.retries}`);
-
-  // ---- Phase 4: parse -----------------------------------------------------
-  console.log("[4/6] Parsing trade events...");
-  const parseBar = new PhaseBar({ label: "Parsing tx", total: fetched.length });
-  const events: ParsedTradeEvent[] = [];
-  const stats = {
-    parsed: 0,
-    skippedNoMeta: 0,
-    skippedNoTime: 0,
-    skippedNotPump: 0,
-    skippedNoTrade: 0,
-    errors: 0,
-  };
-
-  for (let i = 0; i < fetched.length; i++) {
-    const f = fetched[i]!;
-    if (!f.tx) {
-      stats.errors++;
-      parseBar.update(i + 1);
-      continue;
-    }
-    try {
-      const result = parseTradeEventsFromTx(f.tx, f.signature, {
-        targetWallet: cfg.targetWallet,
-        pumpProgramIds: cfg.pumpProgramIds,
-        minSolChange: cfg.minSolChange,
-        minTokenChange: cfg.minTokenChange,
-      });
-      if (result.events.length > 0) {
-        events.push(...result.events);
-        stats.parsed++;
-      } else if (result.reason) {
-        stats[result.reason]++;
-      }
-    } catch (err) {
-      stats.errors++;
-      console.error(`\n       parse error for ${f.signature}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    parseBar.update(i + 1);
-  }
-  parseBar.stop();
-  const buyEvents = events.filter((e) => e.type === "BUY").length;
-  const sellEvents = events.filter((e) => e.type === "SELL").length;
+  // ---- Phase 3: load checkpoint, decide what's left ----------------------
+  console.log("[3/6] Loading checkpoint...");
+  const checkpoint = await loadCheckpoint(cfg.eventsCheckpointFile);
+  // Only consider checkpoint entries whose sig is still inside our current
+  // hoursBack window. This keeps trades.json scoped to the requested range
+  // even if the user shrinks hoursBack between runs.
+  const sigSet = new Set(signatures.map((s) => s.signature));
+  const usableCheckpoint = checkpoint.filter((c) => sigSet.has(c.sig));
+  const processedSigs = new Set(usableCheckpoint.map((c) => c.sig));
+  const allEvents: ParsedTradeEvent[] = usableCheckpoint.flatMap((c) => c.events);
+  let pumpKept = usableCheckpoint.filter((c) => c.kept).length;
+  let ignoredNonPump = usableCheckpoint.filter((c) => !c.kept).length;
   console.log(
-    `       events: BUY=${buyEvents} SELL=${sellEvents}  skipped: notPump=${stats.skippedNotPump} noTrade=${stats.skippedNoTrade} noMeta=${stats.skippedNoMeta} noTime=${stats.skippedNoTime}  errors=${stats.errors}`,
+    `       loaded ${checkpoint.length} entries (${usableCheckpoint.length} in window, ${allEvents.length} cached events)`,
   );
 
-  // Sort events ascending by time so FIFO grouping is correct.
-  events.sort((a, b) => a.blockTime - b.blockTime);
+  const todo = signatures.filter((s) => !processedSigs.has(s.signature));
+  console.log(`       ${todo.length} signatures remaining to fetch`);
 
-  // ---- Phase 5: group -----------------------------------------------------
-  console.log("[5/6] Grouping buy/sell lots...");
-  const lots = groupTrades(events);
-  const records = buildTradeRecords(lots);
-  validateRecords(records);
+  // ---- Phase 4: streaming fetch + filter + parse, with periodic flush ----
+  let txOk = 0;
+  let txErr = 0;
+  let parseErrors = 0;
+  const rejectedProgramFreq = new Map<string, number>();
+
+  if (todo.length > 0) {
+    console.log(`[4/6] Fetching/filtering/parsing ${todo.length} tx in chunks of ${cfg.txChunkSize}...`);
+    const procBar = new PhaseBar({
+      label: "Processing tx",
+      total: signatures.length,
+      showKey: true,
+      showRetries: true,
+    });
+    procBar.update(processedSigs.size);
+
+    const concurrency = Math.max(1, Math.floor(cfg.heliusApiKeys.length * cfg.rateLimitPerKey * 0.9));
+    let processedDone = processedSigs.size;
+    let lastJsonWriteMs = Date.now();
+    const writeIntervalMs = cfg.writeIntervalSec * 1000;
+
+    for (let i = 0; i < todo.length; i += cfg.txChunkSize) {
+      const chunk = todo.slice(i, i + cfg.txChunkSize);
+      const baseDone = processedDone;
+
+      const fetched = await fetchTransactions(client, {
+        signatures: chunk,
+        concurrency,
+        onTick: (done, _total, retries, lastKeyIndex) => {
+          procBar.update(baseDone + done, {
+            keyIndex: lastKeyIndex + 1,
+            keyTotal: cfg.heliusApiKeys.length,
+            retries,
+            label: "Processing tx",
+          });
+        },
+      });
+
+      // Filter + parse this chunk synchronously, building checkpoint entries.
+      const newEntries: CheckpointEntry[] = [];
+      for (const f of fetched) {
+        if (!f.tx) {
+          txErr++;
+          newEntries.push({ sig: f.signature, kept: false, events: [] });
+          continue;
+        }
+        txOk++;
+        const filterResult = isPumpFunTradeTx(f.tx, {
+          pumpFunProgramIds: cfg.pumpFunProgramIds,
+          pumpFunEventAuthority: cfg.pumpFunEventAuthority,
+          pumpFunFeeRecipient: cfg.pumpFunFeeRecipient,
+        });
+        if (!filterResult.isPumpFunTrade) {
+          ignoredNonPump++;
+          collectProgramFreq(f.tx, rejectedProgramFreq);
+          newEntries.push({ sig: f.signature, kept: false, events: [] });
+          continue;
+        }
+        pumpKept++;
+        let events: ParsedTradeEvent[] = [];
+        try {
+          const parseResult = parsePumpFunTrade(f.tx, f.signature, {
+            targetWallet: cfg.targetWallet,
+            minSolChange: cfg.minSolChange,
+            minTokenChange: cfg.minTokenChange,
+          });
+          events = parseResult.events;
+        } catch (err) {
+          parseErrors++;
+          console.error(`\n       parse error for ${f.signature}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        newEntries.push({ sig: f.signature, kept: true, events });
+        if (events.length > 0) allEvents.push(...events);
+      }
+
+      // Append-only checkpoint flush — durably records that this chunk has
+      // been processed. After this point, a crash + restart will skip it.
+      await appendCheckpoint(cfg.eventsCheckpointFile, newEntries);
+
+      processedDone += chunk.length;
+      procBar.update(processedDone, {
+        keyIndex: 0,
+        keyTotal: cfg.heliusApiKeys.length,
+        retries: client.stats.retries,
+        label: "Processing tx",
+      });
+
+      // Periodic trades.json rewrite so the user can monitor progress mid-run.
+      // Atomic (tmp + rename) so a kill mid-write can't corrupt the file.
+      const now = Date.now();
+      if (now - lastJsonWriteMs >= writeIntervalMs) {
+        await flushTradesJson(allEvents, cfg.outputFile);
+        lastJsonWriteMs = now;
+        process.stdout.write(
+          `\n       [periodic flush @ ${new Date(now).toISOString()}] ${allEvents.length} events → ${cfg.outputFile}\n`,
+        );
+      }
+    }
+
+    procBar.stop();
+    console.log(
+      `       processed ${processedDone}/${signatures.length} sigs  (txOk=${txOk}, txErr=${txErr}, kept=${pumpKept}, non-pump=${ignoredNonPump}, parseErrors=${parseErrors})`,
+    );
+
+    if (pumpKept === 0 && ignoredNonPump > 0) {
+      const top = [...rejectedProgramFreq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+      console.log("       diagnostic: top programs in rejected tx (program -> count):");
+      for (const [pid, n] of top) console.log(`         ${pid}  -> ${n}`);
+      console.log(`       (set PUMP_FUN_PROGRAM_ID="id1,id2,..." in .env to add programs)`);
+    }
+  } else {
+    console.log("[4/6] All signatures already processed in checkpoint — skipping fetch.");
+  }
+
+  // ---- Phase 5: final group + write --------------------------------------
+  console.log("[5/6] Grouping buy lots and writing final output...");
+  const records = await flushTradesJson(allEvents, cfg.outputFile);
   const fullyExited = records.filter((r) => r.exit.fullyExited).length;
   const unfinished = records.length - fullyExited;
+  const buyEvents = allEvents.filter((e) => e.type === "BUY").length;
+  const sellEvents = allEvents.filter((e) => e.type === "SELL").length;
   console.log(`       ${records.length} trade records  (fully exited=${fullyExited}, unfinished=${unfinished})`);
 
-  // ---- Phase 6: write -----------------------------------------------------
-  console.log("[6/6] Writing output JSON...");
-  await writeOutput(cfg.outputFile, records);
-
+  // ---- Phase 6: summary --------------------------------------------------
+  // pumpKept + ignoredNonPump = sigs for which we have tx data on disk
+  // (this run's successful fetches + everything in the resumable checkpoint).
+  // txErr counts only this-run fetch failures; resumed-run failures aren't
+  // re-tracked, which is fine because they're long since retried.
   printSummary({
     targetWallet: cfg.targetWallet,
     hoursBack: cfg.hoursBack,
     signaturesFetched: signatures.length,
-    transactionsParsed: stats.parsed,
+    transactionsFetched: pumpKept + ignoredNonPump,
+    pumpTradeTxKept: pumpKept,
+    ignoredNonTradeTx: txErr,
+    ignoredTransferOrNonPumpTx: ignoredNonPump,
     buyEvents,
     sellEvents,
     tradeRecords: records.length,
@@ -164,12 +239,27 @@ async function main(): Promise<void> {
   });
 }
 
-async function writeOutput(outputFile: string, records: TradeRecord[]): Promise<void> {
+async function flushTradesJson(
+  events: ParsedTradeEvent[],
+  outputFile: string,
+): Promise<TradeRecord[]> {
+  const sorted = [...events].sort((a, b) => a.blockTime - b.blockTime);
+  const lots = groupTrades(sorted);
+  const records = buildTradeRecords(lots);
+  validateRecords(records);
+  await writeOutputAtomic(outputFile, records);
+  return records;
+}
+
+async function writeOutputAtomic(outputFile: string, records: TradeRecord[]): Promise<void> {
   await fs.mkdir(path.dirname(outputFile), { recursive: true });
   const json = JSON.stringify(records, null, 2);
-  // Round-trip parse to guarantee valid JSON before persisting.
-  JSON.parse(json);
-  await fs.writeFile(outputFile, json, "utf8");
+  JSON.parse(json); // round-trip guarantee
+  // Atomic write: pour into a sibling tmp file then rename. If we get killed
+  // mid-write, the original trades.json remains intact.
+  const tmp = `${outputFile}.tmp-${process.pid}`;
+  await fs.writeFile(tmp, json, "utf8");
+  await fs.rename(tmp, outputFile);
 }
 
 function validateRecords(records: TradeRecord[]): void {
@@ -183,23 +273,57 @@ function validateRecords(records: TradeRecord[]): void {
         throw new Error(`Sells not sorted by delaySec on trade ${r.tradeNumber}`);
       }
     }
+    if (r.pattern.sellCount !== r.sells.length) {
+      throw new Error(`pattern.sellCount mismatch on trade ${r.tradeNumber}`);
+    }
+    const expectedSeq = r.sells.map((s) => s.pct);
+    if (r.pattern.sequence.length !== expectedSeq.length ||
+        r.pattern.sequence.some((v, k) => v !== expectedSeq[k])) {
+      throw new Error(`pattern.sequence != sells.map(pct) on trade ${r.tradeNumber}`);
+    }
+    if (r.exit.fullyExited && r.sells.length > 0) {
+      const sumPct = r.sells.reduce((acc, s) => acc + s.pct, 0);
+      if (Math.abs(sumPct - 100) > 5) {
+        throw new Error(`fully exited trade ${r.tradeNumber} pct sum=${sumPct}, expected ~100`);
+      }
+    }
   }
 }
 
 function printSummary(s: RunSummary): void {
   console.log("");
   console.log("==================== Run Summary ====================");
-  console.log(`Target wallet     : ${s.targetWallet}`);
-  console.log(`Hours back        : ${s.hoursBack}`);
-  console.log(`Signatures fetched: ${s.signaturesFetched}`);
-  console.log(`Transactions parsed: ${s.transactionsParsed}`);
-  console.log(`Buy events        : ${s.buyEvents}`);
-  console.log(`Sell events       : ${s.sellEvents}`);
-  console.log(`Trade records     : ${s.tradeRecords}`);
-  console.log(`  fully exited    : ${s.fullyExited}`);
-  console.log(`  unfinished      : ${s.unfinished}`);
-  console.log(`Output file       : ${s.outputFile}`);
+  console.log(`Target wallet            : ${s.targetWallet}`);
+  console.log(`Hours back               : ${s.hoursBack}`);
+  console.log(`Signatures fetched       : ${s.signaturesFetched}`);
+  console.log(`Transactions fetched     : ${s.transactionsFetched}`);
+  console.log(`Pump.fun trade tx kept   : ${s.pumpTradeTxKept}`);
+  console.log(`Ignored non-trade tx     : ${s.ignoredNonTradeTx}`);
+  console.log(`Ignored transfer/non-Pump: ${s.ignoredTransferOrNonPumpTx}`);
+  console.log(`Buy events               : ${s.buyEvents}`);
+  console.log(`Sell events              : ${s.sellEvents}`);
+  console.log(`Trade records            : ${s.tradeRecords}`);
+  console.log(`  fully exited           : ${s.fullyExited}`);
+  console.log(`  unfinished             : ${s.unfinished}`);
+  console.log(`Output file              : ${s.outputFile}`);
   console.log("=====================================================");
+}
+
+function collectProgramFreq(tx: FullTransaction, freq: Map<string, number>): void {
+  const keys = extractAccountKeys(tx);
+  const seen = new Set<string>();
+  const visit = (ix: { programId?: string; programIdIndex?: number }): void => {
+    let pid: string | undefined;
+    if (typeof ix.programId === "string") pid = ix.programId;
+    else if (typeof ix.programIdIndex === "number") pid = keys[ix.programIdIndex];
+    if (pid) seen.add(pid);
+  };
+  for (const ix of tx.transaction.message.instructions ?? []) visit(ix);
+  const inner = tx.meta?.innerInstructions ?? [];
+  for (const group of inner as Array<{ instructions?: Array<{ programId?: string; programIdIndex?: number }> }>) {
+    for (const ix of group.instructions ?? []) visit(ix);
+  }
+  for (const pid of seen) freq.set(pid, (freq.get(pid) ?? 0) + 1);
 }
 
 main().catch((err) => {

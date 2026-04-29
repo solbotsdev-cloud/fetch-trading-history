@@ -6,6 +6,12 @@ function round(n: number, decimals: number): number {
   return Math.round(n * f) / f;
 }
 
+function toIsoUtc(unixSeconds: number): string {
+  // blockTime is unix seconds; render as second-precision ISO 8601 UTC ("Z").
+  if (!Number.isFinite(unixSeconds)) return "";
+  return new Date(unixSeconds * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
   const s = Math.round(seconds);
@@ -40,8 +46,9 @@ export function buildTradeRecords(lots: OpenLot[]): TradeRecord[] {
 
     const sellsOut = sellsSorted.map((s) => ({
       multiplier: round(s.multiplier, 2),
-      pct: round(s.rawPct, 1),
+      pct: Math.round(s.rawPct),
       delaySec: Math.round(s.delaySec),
+      time: toIsoUtc(s.sellTime),
     }));
 
     let exitTimeSec: number | null = null;
@@ -51,7 +58,7 @@ export function buildTradeRecords(lots: OpenLot[]): TradeRecord[] {
       pnlSol = round(lot.totalSellSol - lot.buySol, 4);
     }
 
-    const sequence = sellsOut.map((s) => Math.round(s.pct));
+    const sequence = sellsOut.map((s) => s.pct);
     const firstMultiplier = sellsOut.length > 0 ? sellsOut[0]!.multiplier : null;
     const durationSec = fullyExited
       ? exitTimeSec
@@ -72,6 +79,7 @@ export function buildTradeRecords(lots: OpenLot[]): TradeRecord[] {
       buy: {
         sol: round(lot.buySol, 4),
         tx: lot.buySignature,
+        time: toIsoUtc(lot.buyTime),
       },
       sells: sellsOut,
       exit: {

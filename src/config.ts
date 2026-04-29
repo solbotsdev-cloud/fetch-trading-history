@@ -41,16 +41,49 @@ export function loadConfig(): AppConfig {
   }
 
   const rateLimitPerKey = parseNumber(process.env.RATE_LIMIT_PER_KEY, 8, "RATE_LIMIT_PER_KEY");
-  if (rateLimitPerKey <= 0 || rateLimitPerKey > 10) {
-    throw new Error(`RATE_LIMIT_PER_KEY must be in (0, 10], got ${rateLimitPerKey}`);
+  if (rateLimitPerKey <= 0 || rateLimitPerKey > 100) {
+    throw new Error(`RATE_LIMIT_PER_KEY must be in (0, 100], got ${rateLimitPerKey}`);
   }
 
   const outputFile = (process.env.OUTPUT_FILE ?? "data/trades.json").trim();
   const resolvedOutput = path.isAbsolute(outputFile) ? outputFile : path.resolve(process.cwd(), outputFile);
 
-  const pumpProgramIds = parseList(process.env.PUMP_PROGRAM_IDS);
+  const checkpointFile = (process.env.EVENTS_CHECKPOINT_FILE ?? "data/events.jsonl").trim();
+  const resolvedCheckpoint = path.isAbsolute(checkpointFile)
+    ? checkpointFile
+    : path.resolve(process.cwd(), checkpointFile);
+
+  const writeIntervalSec = parseNumber(process.env.WRITE_INTERVAL_SEC, 3600, "WRITE_INTERVAL_SEC");
+  if (writeIntervalSec <= 0) {
+    throw new Error(`WRITE_INTERVAL_SEC must be positive, got ${writeIntervalSec}`);
+  }
+
+  const txChunkSize = parseNumber(process.env.TX_CHUNK_SIZE, 1000, "TX_CHUNK_SIZE");
+  if (!Number.isInteger(txChunkSize) || txChunkSize < 50) {
+    throw new Error(`TX_CHUNK_SIZE must be an integer >= 50, got ${txChunkSize}`);
+  }
+
+  const userProgramIds = parseList(process.env.PUMP_FUN_PROGRAM_ID);
+  // Defaults cover the active Pump.fun program family:
+  //   - legacy bonding curve (older tx)
+  //   - current bonding curve (post-migration, what most live trades execute)
+  //   - PumpSwap AMM (graduated tokens)
+  // Users may override via env (comma-separated list).
+  const pumpFunProgramIds =
+    userProgramIds.length > 0
+      ? userProgramIds
+      : [
+          "6EF8rrecthR5DkXPBu7q1yUPQsFEe1J7a6A9fPpump",
+          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+          "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+        ];
+  const pumpFunEventAuthority =
+    (process.env.PUMP_FUN_EVENT_AUTHORITY ?? "").trim() || "Ce6TQqeHCWjNFyMS3kH2vQU3J9gnMMtDU4LiwYfPUEA";
+  const pumpFunFeeRecipient =
+    (process.env.PUMP_FUN_FEE_RECIPIENT ?? "").trim() || "G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP";
+
   const minSolChange = parseNumber(process.env.MIN_SOL_CHANGE, 0.000001, "MIN_SOL_CHANGE");
-  const minTokenChange = parseNumber(process.env.MIN_TOKEN_CHANGE, 1, "MIN_TOKEN_CHANGE");
+  const minTokenChange = parseNumber(process.env.MIN_TOKEN_CHANGE, 0.000001, "MIN_TOKEN_CHANGE");
 
   return {
     targetWallet,
@@ -58,7 +91,12 @@ export function loadConfig(): AppConfig {
     heliusApiKeys,
     rateLimitPerKey,
     outputFile: resolvedOutput,
-    pumpProgramIds,
+    eventsCheckpointFile: resolvedCheckpoint,
+    writeIntervalSec,
+    txChunkSize,
+    pumpFunProgramIds,
+    pumpFunEventAuthority,
+    pumpFunFeeRecipient,
     minSolChange,
     minTokenChange,
   };
